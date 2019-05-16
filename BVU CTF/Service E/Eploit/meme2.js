@@ -1,0 +1,2 @@
+alert();
+var b = "tielk"
