@@ -1,0 +1,560 @@
+###Two-factor-apache###
+#auth       required     pam_oath.so usersfile=/etc/liboath/users.oath digits=8 debug
+auth       required     pam_oath.so usersfile=/etc/liboath/users.oath digits=8
+#
+# The PAM configuration file for the Shadow `login' service
+#
+
+# Enforce a minimal delay in case of failure (in microseconds).
+# (Replaces the `FAIL_DELAY' setting from login.defs)
+# Note that other modules may require another minimal delay. (for example,
+# to disable any delay, you should add the nodelay option to pam_unix)
+#auth       optional   pam_faildelay.so  delay=3000000
+
+# Disallows root logins except on tty's listed in /etc/securetty
+# (Replaces the `CONSOLE' setting from login.defs)
+#
+# With the default control of this module:
+#   [success=ok new_authtok_reqd=ok ignore=ignore user_unknown=bad default=die]
+# root will not be prompted for a password on insecure lines.
+# if an invalid username is entered, a password is prompted (but login
+# will eventually be rejected)
+#
+# You can change it to a "requisite" module if you think root may mis-type
+# her login and should not be prompted for a password in that case. But
+# this will leave the system as vulnerable to user enumeration attacks.
+#
+# You can change it to a "required" module if you think it permits to
+# guess valid user names of your system (invalid user names are considered
+# as possibly being root on insecure lines), but root passwords may be
+# communicated over insecure lines.
+#auth [success=ok new_authtok_reqd=ok ignore=ignore user_unknown=bad default=die] pam_securetty.so
+
+# Disallows other than root logins when /etc/nologin exists
+# (Replaces the `NOLOGINS_FILE' option from login.defs)
+#auth       requisite  pam_nologin.so
+
+# SELinux needs to be the first session rule. This ensures that any
+# lingering context has been cleared. Without this it is possible
+# that a module could execute code in the wrong domain.
+# When the module is present, "required" would be sufficient (When SELinux
+# is disabled, this returns success.)
+#session [success=ok ignore=ignore module_unknown=ignore default=bad] pam_selinux.so close
+
+# Sets the loginuid process attribute
+#session    required     pam_loginuid.so
+
+# SELinux needs to intervene at login time to ensure that the process
+# starts in the proper default security context. Only sessions which are
+# intended to run in the user's context should be run after this.
+#session [success=ok ignore=ignore module_unknown=ignore default=bad] pam_selinux.so open
+# When the module is present, "required" would be sufficient (When SELinux
+# is disabled, this returns success.)
+
+
+# Standard Un*x authentication.
+@include common-auth
+
+# Create a new session keyring.
+#session    optional   pam_keyinit.so force revoke
+
+# Standard Un*x account and session
+#@include common-account
+#@include common-session
+@include common-password
+
+
+###docker-compose.yml
+version: '2.2'
+services:
+  2fapache:
+    hostname: "2fapache.${HOST_HOSTNAME}"
+    build: .
+    init: true
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+    volumes:
+     - ./htdocs:/usr/local/apache2/htdocs/:ro
+     - ./data/httpd.conf:/usr/local/apache2/conf/httpd.conf:ro
+     - ./cgi-bin:/usr/local/apache2/cgi-bin/:ro
+     - ./data/pam-2fapache:/etc/pam.d/2fapache:ro
+     - ./spawn_apache_fcgi:/usr/local/sbin/spawn_apache_fcgi:ro
+     - ./data/cookie_key:/usr/local/apache2/conf/cookie_key:ro
+     - ./data/home:/home:rw
+     - ./data/liboath:/etc/liboath:rw
+     - ./sock_dir:/usr/local/apache2/sock_dir:rw
+     - ./listen_unix.so:/usr/local/apache2/lib/listen_unix.so:ro
+     - etc:/etc
+    network_mode: "none"
+volumes:
+  etc: {}
+
+###authenticate.py
+
+import fcntl
+import os
+import sys
+import urllib.parse
+
+from pamela import PAMError, PAM_AUTHENTICATE, PAM_REINITIALIZE_CRED, PAM_SETCRED, \
+        new_simple_password_conv, pam_end, pam_start
+
+
+def pam_auth(user, *secrets):
+    pid = os.fork()
+    # PAM stack does weird stuff with process credentials and umask, so do it in a subprocess
+    if pid == 0:
+        conv = new_simple_password_conv(secrets, 'utf-8')
+
+        try:
+            handle = pam_start('2fapache', user, conv_func=conv, encoding='utf-8')
+
+            fd = os.open('/tmp/lock', os.O_WRONLY | os.O_CREAT)
+            # pam_oath can't handle concurrent logins correctly
+            # (OATH_FILE_UNLINK_ERROR: System error when removing file)
+            fcntl.lockf(fd, fcntl.LOCK_EX)
+            try:
+                retval = PAM_AUTHENTICATE(handle, 0)
+                # Re-initialize credentials (for Kerberos users, etc)
+                # Don't check return code of pam_setcred(), it shouldn't matter
+                # if this fails
+                if retval == 0 and PAM_REINITIALIZE_CRED:
+                    PAM_SETCRED(handle, PAM_REINITIALIZE_CRED)
+            finally:
+                fcntl.lockf(fd, fcntl.LOCK_UN)
+                os.close(fd)
+
+            pam_end(handle, retval)
+            os._exit(retval)
+        except PAMError as e:
+            print(e, file=sys.stderr)
+            os._exit(1)
+    else:
+        pid, res = os.waitpid(pid, 0)
+        return os.WIFEXITED(res) and os.WEXITSTATUS(res) == 0
+
+
+def authorize(env, headers):
+    return 'REMOTE_USER' in env
+
+
+def parse_get(env):
+    return urllib.parse.parse_qs(env.get('QUERY_STRING', ''))
+
+
+def authenticate(env, headers):
+    if not env['REQUEST_URI'].startswith('/cgi-bin/do-login?'):
+        # Apache redirects anyone without a valid auth cookie to the login page
+        # so no point in re-authenticating every request
+        print('already logged in - skipping authentication', file=sys.stderr)
+        return True
+
+    # Apache doesn't pass along post data during the authentication phase, so we have to get otp
+    # from a GET param. That's fine because HOTPs become invalid after being used.
+    otp = parse_get(env).get('otp', [None])[0]
+    print('authenticating {} {} {}'.format(repr(env['REMOTE_USER']), repr(env['REMOTE_PASSWD']),
+                                           repr(otp)),
+          file=sys.stderr)
+    return otp and pam_auth(env['REMOTE_USER'], otp, env['REMOTE_PASSWD'])
+
+###dav.py
+
+""" Well, this isn't really WebDAV - didn't feel like all that XML... """
+
+import errno
+import html
+from os import chmod, listdir, mkdir, rename, rmdir, setegid, seteuid, stat, unlink
+from os.path import basename, dirname, isdir, join
+from pwd import getpwnam
+from tempfile import NamedTemporaryFile
+
+import magic
+
+from .utils import show_template
+
+
+def dav_GET(path, env, start_response):
+    if not dav_HEAD(path, env, start_response):
+        return
+
+    try:
+        with open(path, 'rb') as f:
+            while True:
+                d = f.read(1024*1024)
+                if not d:
+                    break
+                yield d
+    except IsADirectoryError:
+        yield from show_template('dir_pre', {'path': html.escape(path)}, None, None)
+
+        fmt = "<a href='{0}' class='list-group-item list-group-item-action'>{0}</a>"
+
+        yield "<a href='.' class='list-group-item list-group-item-action active'>.</a>"
+        yield fmt.format('..')
+        for entry in listdir(path):
+            yield fmt.format(html.escape(entry))
+
+        yield from show_template('dir_post', {}, None, None)
+
+
+def dav_HEAD(path, env, start_response):
+    try:
+        meta = stat(path)
+    except FileNotFoundError:
+        start_response(b'404 Not Found', [])
+        return False
+    except PermissionError:
+        start_response(b'403 Forbidden', [])
+        return False
+    except OSError:
+        start_response(b'500 Internal Server Error', [])
+        return False
+
+    mime = magic.mime_magic.file(path)
+    if mime is None:
+        start_response(b'500 Internal Server Error', [])
+        return False
+
+    if mime == 'inode/directory; charset=binary':
+        canon_url = env['REQUEST_URI'] + '/'
+        headers = [(b'Content-Type', b'text/html; charset=utf-8')]
+    else:
+        headers = [
+            (b'Content-Type', mime),
+            (b'Content-Length', str(meta.st_size))
+        ]
+        canon_url = env['REQUEST_URI']
+    canon_url = canon_url.replace('//', '/').replace('//', '/')
+    if env['REQUEST_URI'] != canon_url:
+        start_response(b'302 Found', [(b'Location', canon_url)])
+        return False
+
+    start_response(b'200 OK', headers)
+    return True
+
+
+def dav_PUT(home, path, env, start_response):
+    try:
+        path_dir = '/'
+        public = False
+        for d in path.split('/')[:-1]:
+            path_dir += d + '/'
+            if d == 'public':
+                public = True
+            if not isdir(path_dir):
+                mkdir(path_dir, mode=0o750 if public else 0o710)
+
+        with NamedTemporaryFile(prefix=basename(path), dir=path_dir, delete=False) as f:
+            try:
+                chmod(f.name, 0o640 if public else 0o600)
+
+                written = 0
+                while True:
+                    d = env['wsgi.input'].read(1024 * 1024)
+                    if not d:
+                        break
+                    f.write(d)
+                    written += len(d)
+                    if written > 1024*1024:
+                        raise OSError('quota exceeded')
+                f.flush()
+                rename(f.name, path)
+            except Exception as e:
+                unlink(f.name)
+                raise e
+    except FileNotFoundError:
+        start_response(b'404 Not Found', [])
+        return []
+    except PermissionError:
+        start_response(b'403 Forbidden', [])
+        return []
+    except OSError:
+        start_response(b'500 Internal Server Error', [])
+        return []
+
+    start_response(b'201 Created', [])
+    return []
+
+
+def dav_DELETE(path, env, start_response):
+    try:
+        try:
+            unlink(path)
+        except IsADirectoryError:
+            rmdir(path)
+    except FileNotFoundError:
+        start_response(b'404 Not Found', [])
+        return []
+    except PermissionError:
+        start_response(b'403 Forbidden', [])
+        return []
+    except OSError:
+        start_response(b'500 Internal Server Error', [])
+        return []
+
+    start_response(b'204 No Content', [])
+    return []
+
+
+def dav_responder(env, start_response):
+    user, _, path = env['REQUEST_URI'][2:].partition('/')
+    try:
+        pw = getpwnam(user)
+    except KeyError:
+        start_response(b'404 Not Found', [])
+        return []
+
+    path = join(pw.pw_dir, path)
+
+    setegid(pw.pw_gid)
+    seteuid(pw.pw_uid)
+
+    try:
+        if env['REQUEST_METHOD'] == 'GET':
+            return dav_GET(path, env, start_response)
+        elif env['REQUEST_METHOD'] == 'HEAD':
+            dav_HEAD(path, env, start_response)
+            return []
+        elif env['REQUEST_METHOD'] == 'PUT':
+            return dav_PUT(pw.pw_dir, path, env, start_response)
+        elif env['REQUEST_METHOD'] == 'DELETE':
+            return dav_DELETE(path, env, start_response)
+        else:
+            start_response(b'405 Method Not Allowed', [])
+            return []
+    finally:
+        seteuid(0)
+        setegid(0)
+
+
+###handler.py
+#!/usr/bin/env python3
+
+import urllib.parse
+
+import flup.server.fcgi_base
+from flup.server.fcgi_fork import WSGIServer
+from flup.server.fcgi_base import FCGI_AUTHORIZER, FCGI_RESPONDER
+
+from .authenticate import authenticate, authorize
+from .dav import dav_responder
+from .register import do_register
+from .show_login import show_login
+from .show_register import show_register
+
+#flup.server.fcgi_base.DEBUG = 10
+
+
+def fcgi_authorizer(env, start_response):
+    status, headers = b'401 ', []
+
+    if env.get('FCGI_APACHE_ROLE') == "AUTHORIZER" and authorize(env, headers):
+        status = b'200 OK'
+    elif env.get('FCGI_APACHE_ROLE') == "AUTHENTICATOR" and authenticate(env, headers):
+        status = b'200 OK'
+
+    start_response(status, headers)
+    return []
+
+
+def fcgi_responder(env, start_response):
+    if env['REQUEST_URI'] == '/cgi-bin/login':
+        return show_login(env, start_response)
+    elif env['REQUEST_URI'] == '/cgi-bin/sign-up':
+        return show_register(env, start_response)
+    elif env['REQUEST_URI'] == '/cgi-bin/do-register':
+        return do_register(env, start_response)
+    elif env['REQUEST_URI'] == '/cgi-bin/' or env['REQUEST_URI'].startswith('/cgi-bin/do-login?'):
+        start_response(b'302 Found', [(b'Location', '/~' + urllib.parse.quote(env['REMOTE_USER']) + '/')])
+        return []
+    elif env['REQUEST_URI'].startswith('/~'):
+        return dav_responder(env, start_response)
+    else:
+        start_response(b'404 Not Found', [])
+        return []
+
+
+def app(env, start_response):
+    if env.get('FCGI_ROLE') == 'AUTHORIZER':
+        return fcgi_authorizer(env, start_response)
+    else:
+        return fcgi_responder(env, start_response)
+
+
+serv = WSGIServer(app, bindAddress=('::1', 808, 0), roles=(FCGI_AUTHORIZER, FCGI_RESPONDER))
+serv.debug = False
+serv.run()
+
+
+
+###register.py
+
+import pwd
+import socket
+import string
+import urllib.parse
+from base64 import b32encode
+from fcntl import LOCK_EX, LOCK_UN, lockf
+from subprocess import PIPE, run
+
+from .utils import parse_post, show_template, token
+
+
+def new_oath(user):
+    assert not any(c.isspace() for c in user)
+    hostname = urllib.parse.quote_plus(socket.gethostname())
+
+    key = token(alphabet=string.digits + 'abcdef', bits=256)
+
+    key_b32 = urllib.parse.quote_plus(b32encode(bytes.fromhex(key)).decode('utf-8'))
+    user_encoded = urllib.parse.quote_plus(user)
+    url_fmt = 'otpauth://totp/{user_encoded}@{hostname}?digits=8&period=30&secret={key_b32}'
+    url = url_fmt.format(**locals()).encode('utf-8')
+    qr = run(['qrencode', '-o', '-', '-t', 'UTF8'], input=url, check=True, stdout=PIPE)
+
+    with open('/etc/liboath/users.oath', 'a') as f:
+        lockf(f.fileno(), LOCK_EX)
+        try:
+            f.write('HOTP/T30/8 {user} - {key}\n'.format(**locals()))
+            f.flush()
+        finally:
+            lockf(f, LOCK_UN)
+
+    return qr.stdout
+
+
+def register(name, password):
+    try:
+        pwd.getpwnam(name)
+        return False
+    except KeyError:
+        pass
+    if '\0' in password or ':' in password or ':' in name or '\0' in name or name in ('.', '..'):
+        return False
+
+    cmd = "{name}:{password}::web_users:user from web:/home/{name}:/sbin/nologin"
+    run(['newusers'], input=cmd.format(**locals()).encode('utf-8'))
+
+    return True
+
+
+def do_register(env, start_response):
+    if env['REQUEST_METHOD'] != 'POST':
+        start_response(b'302 Found', [(b'Location', '/cgi-bin/sign-up')])
+        return []
+
+    post = parse_post(env)
+    name = post.get(b'user', [b''])[0].decode('utf-8')
+    password = post.get(b'pass', [b''])[0].decode('utf-8')
+    password2 = post.get(b'pass2', [b''])[0].decode('utf-8')
+
+    if not name or password != password2:
+        start_response(b'302 Found', [(b'Location', '/cgi-bin/sign-up')])
+        return []
+
+    if register(name, password):
+        qr_data = new_oath(name).decode('utf8')
+        return show_template('registered', {'qr': qr_data, 'user': name}, [], start_response)
+    else:
+        start_response(b'409 Conflict', [])
+        return []
+
+###show_login.py
+import html
+from urllib.parse import parse_qs, urlencode
+
+from .utils import show_template, token
+
+
+def show_login(env, start_response):
+    session = parse_qs(env.get('HTTP_SESSION', ''))
+    session['csrf'] = token()
+    headers = [(b'Replace-Session', urlencode(session, doseq=True))]
+
+    location = env.get('HTTP_REFERER', '/')
+    if location.split('/', 3)[-1] in ('cgi-bin/sign-up', 'cgi-bin/login', 'cgi-bin/sign-up', 'cgi-bin/do-register'):
+        location = '/'
+
+    form_data = {
+        'user': [''],
+        'httpd_location': [location]
+    }
+    form_data.update(parse_qs(env.get('wsgi.stdin'), ''))
+    form_data['csrf_token'] = [session['csrf']]
+    form_data = {k: html.escape(v[0]) for k, v in form_data.items()}
+
+    return show_template('login', form_data, headers, start_response)
+
+###show_register.py
+
+import html
+from urllib.parse import parse_qs, urlencode
+
+from .utils import show_template, token
+
+
+def show_register(env, start_response):
+    session = parse_qs(env.get('HTTP_SESSION', ''))
+    session['csrf'] = token()
+    headers = [(b'Replace-Session', urlencode(session, doseq=True))]
+
+    form_data = {
+        'user': [''],
+    }
+    form_data.update(parse_qs(env.get('wsgi.stdin'), ''))
+    form_data['csrf_token'] = session['csrf']
+    form_data = {k: html.escape(v[0]) for k, v in form_data.items()}
+
+    return show_template('register', form_data, headers, start_response)
+
+###utils.py
+
+import math
+import os.path
+import string
+import urllib.parse
+from random import SystemRandom
+random = SystemRandom()
+
+
+def show_template(name, fmt, headers, start_response):
+    if start_response:
+        headers.append((b'Content-Type', b'text/html; charset=utf-8'))
+        start_response(b'200 OK', headers)
+    name = os.path.join(os.path.dirname(__file__), name + '.in')
+    out = []
+    with open(name, 'r') as f:
+        for l in f:
+            out.append(l.format(**fmt).encode('utf-8'))
+    return out
+
+
+def token(*, length=None, alphabet=string.ascii_letters + string.digits, bits=None):
+    if length is None:
+        if bits is None:
+            length = 30
+        else:
+            char_bits = math.log2(len(alphabet))
+            length = 1
+            length = math.ceil(bits / char_bits)
+            # just in case floats are being weird:
+            while (len(alphabet) ** length).bit_length() < bits:
+                length += 1
+    else:
+        assert bits is None
+
+    return "".join(random.choice(alphabet) for _ in range(length))
+
+
+def parse_post(env):
+    try:
+        request_body_size = int(env.get('CONTENT_LENGTH', 0))
+    except ValueError:
+        request_body_size = 0
+
+    # print(repr(request_body_size), file=sys.stderr)
+    request_body = env['wsgi.input'].read(request_body_size)
+    # print(repr(request_body), file=sys.stderr)
+    d = urllib.parse.parse_qs(request_body)
+    # print(repr(d), file=sys.stderr)
+    return d

@@ -1,0 +1,362 @@
+###ResponsiveSecurity
+
+###App.py
+import flask
+import os
+
+app = flask.Flask(__name__)
+
+from client import client
+from pwned_passwords import pwned
+from storage import storage
+
+class Config:
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///data/storage.db'
+    SQLALCHEMY_TRACK_MODIFICATIONS = False # quiet the startup warning
+    SQLALCHEMY_ECHO = False # enable to see sql queries made by storage module
+
+app.config.from_object(Config)
+
+app.register_blueprint(client, url_prefix = "/client")
+app.register_blueprint(pwned, url_prefix = "/pwned")
+app.register_blueprint(storage, url_prefix = "/storage")
+
+@app.route("/")
+def index():
+    return flask.redirect(flask.url_for("client.send_page", page="entry.html"))
+
+@app.route("/favicon.<suffix>")
+def favicon(suffix):
+    return flask.redirect(flask.url_for("static", filename="favicon."+suffix), code=301)
+
+###client.py
+"""
+The real application code is javascript.
+The /client path should only be accessible by the owning team and the gameserver.
+
+ - the team can access the file where the product key is stored.
+ - the gameserver queries /client/get_prodcut_key to receive an encrypted copy that it can decrypt.
+
+The endpoints defined in other modules are accessible by everyone.
+
+"""
+
+import flask
+import secrets
+import os
+import hashlib
+import nacl.encoding
+import nacl.public
+import tempfile
+
+DIR = os.path.dirname(os.path.abspath(__file__))
+PRODUCT_KEY_FILE = os.path.join(DIR, "data/product_key.txt")
+GAMESERVER_PUBLIC_KEY_FILE = os.path.join(DIR, "gameserver_public_key.txt")
+
+def ensure_product_key_exists():
+    """atomically create a product key file
+    - first, generate a fresh product key
+    - then, try to link it to the known position.
+        if the target file already exists, discard the generated key"""
+    l = secrets.token_hex(8).upper()
+    PRODUCT_KEY = "{}-{}-{}-{}".format(l[0:4], l[4:8], l[8:12], l[12:16])
+    with tempfile.NamedTemporaryFile(dir=os.path.join(DIR, "data")) as f:
+        f.write(PRODUCT_KEY.encode() + b"\n")
+        f.flush()
+        try:
+            os.link(f.name, PRODUCT_KEY_FILE)
+        except FileExistsError: pass
+
+# load PRODUCT_KEY from file
+ensure_product_key_exists()
+with open(PRODUCT_KEY_FILE) as f:
+    PRODUCT_KEY = f.read().strip()
+
+# load gameserver GAMESERVER_PUBLIC_KEY from file
+with open(GAMESERVER_PUBLIC_KEY_FILE) as f:
+    GAMESERVER_PUBLIC_KEY = nacl.public.PublicKey(
+            f.read().strip(),
+            encoder = nacl.encoding.HexEncoder)
+
+
+client = flask.Blueprint("client", __name__)
+
+@client.route("/")
+def index():
+    return flask.redirect(flask.url_for("client.send_page", page="entry.html"))
+
+@client.route("/<path:page>")
+def send_page(page):
+    flask.g.product_key = flask.request.args.get("product_key", "") or flask.request.cookies.get("product_key", "")
+    
+    if flask.g.product_key.lower() != PRODUCT_KEY.lower():
+        return flask.render_template("product_key.html", PRODUCT_KEY_FILE = PRODUCT_KEY_FILE), 401
+    return flask.send_from_directory(os.path.join(client.root_path, "client"), page)
+
+@client.route("/get_product_key")
+def get_prodcut_key():
+    box = nacl.public.SealedBox(GAMESERVER_PUBLIC_KEY)
+    encrypted = box.encrypt(PRODUCT_KEY.encode(), encoder = nacl.encoding.HexEncoder)
+    return encrypted
+###generate.py
+import sys
+import collections
+
+infile = sys.argv[1]
+
+d = collections.defaultdict(list)
+
+for line in open(infile):
+    prefix = line[:5]
+    suffix = line[5:]
+    d[prefix].append(suffix)
+for prefix, suffices in d.items():
+    with open(prefix, "w") as f:
+        f.writelines(suffices)
+###pwned_passwords.py
+import flask
+import os
+import mmap
+
+
+
+hash_file = open("hashes.lst.sorted", "rb")
+mm = mmap.mmap(hash_file.fileno(), 0, access=mmap.ACCESS_READ)
+nhashes = len(mm) // 41 # 41 = length of sha1-hash + newline
+print("nhashes", nhashes)
+
+pwned = flask.Blueprint("pwned", __name__)
+
+@pwned.route("/")
+def index():
+    return "TODO: link api doc"
+
+@pwned.route("/range/<prefix>")
+def hash_range(prefix):
+    prefix = prefix.encode()
+    if len(prefix) != 5:
+        return "bad request", 400
+    first = 0
+    count = nhashes
+    while count > 0:
+        step = count // 2
+        mid = first + step
+        if mm[41 * mid : 41*mid + 5] < prefix:
+            first = mid+1
+            count -= step+1
+        else:
+            count = step
+    def generate():
+        i = first
+        while True:
+            line = mm[41*i : 41*i + 41]
+            if line[:5] != prefix:
+                break
+            yield line[5:]
+            i += 1
+
+    r = flask.Response(generate(), mimetype = "text/plain")
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    return r
+
+###storage.py
+
+import flask
+from flask_sqlalchemy import SQLAlchemy
+
+
+import werkzeug.routing
+import datetime
+from werkzeug.exceptions import Forbidden, NotFound
+import re
+
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import Column, String, ForeignKey, DateTime
+from sqlalchemy.orm import relationship
+
+
+EXPIRE = datetime.timedelta(minutes = 20)
+
+storage = flask.Blueprint("storage", __name__)
+
+
+@storage.record_once
+def setup_db(state):
+    db = SQLAlchemy(state.app)
+
+    with state.app.app_context():
+        Model.metadata.create_all(bind=db.engine)
+
+    state.app.config["storage.db"] = db
+
+def db_session():
+    return flask.current_app.config["storage.db"].session
+
+
+USER_REGEX = r"(?P<user>[a-f0-9]{20})"
+DIR_REGEX = r"(?P<dirname>([^/]+/)*)"
+FILE_REGEX = USER_REGEX + "/" + DIR_REGEX + r"(?P<basename>[^/]+)"
+
+def nonames(r):
+    """Remove named groups from a regex string to use it in an URL converter"""
+    return re.sub(r"\(\?P<[^>]+>", "(", r)
+
+assert re.match("^"+USER_REGEX+"$", "aaaaabbbbbcccccddddd")
+assert re.match("^"+DIR_REGEX+"$", "")
+assert re.match("^"+DIR_REGEX+"$", "a/")
+assert re.match("^"+DIR_REGEX+"$", "a/bbb/")
+assert re.match("^"+FILE_REGEX+"$", "aaaaabbbbbcccccddddd/asdf")
+assert re.match("^"+FILE_REGEX+"$", "aaaaabbbbbcccccddddd/asdf/89cadv")
+
+
+class Promise:
+    def __init__(self, callme):
+        self.callme = callme
+
+@storage.before_request
+def resolve_promises():
+    for k in list(flask.request.view_args.keys()):
+        if isinstance(flask.request.view_args[k], Promise):
+            flask.request.view_args[k] = flask.request.view_args[k].callme()
+
+Model = declarative_base()
+
+class User(Model):
+    __tablename__ = "user"
+    key = Column(String(40), primary_key = True)
+    expire = Column(DateTime)
+    entries = relationship("Entry", back_populates = "user")
+    def refresh(self):
+        self.expire = datetime.datetime.now() + EXPIRE
+
+
+def query_user(key, create = False):
+    u = db_session().query(User).filter_by(key = key).first()
+    if u is None:
+        if create:
+            u = User(key = key, expire = datetime.datetime.now() + EXPIRE)
+            db_session().add(u)
+    if u is None:
+        raise NotFound("invalid user key")
+    return u
+
+class UserConverter(werkzeug.routing.BaseConverter):
+    regex = nonames(USER_REGEX)
+    def __init__(self, url_map, create = False):
+        super().__init__(url_map)
+        self.__create = create
+    def to_python(self, s):
+        def get_user():
+            return query_user(key = s, create = self.__create)
+        return Promise(get_user)
+    def to_url(u):
+        return u.key
+
+class Entry(Model):
+    __tablename__ = "entry"
+    user_key = Column(String(40), ForeignKey("user.key"), primary_key = True)
+    path = Column(String(100), primary_key = True)
+    payload = Column(String(300))
+    
+    user = relationship("User", back_populates = "entries")
+
+
+class EntryConverter(werkzeug.routing.PathConverter):
+    regex = nonames(FILE_REGEX)
+    def __init__(self, url_map, create = False):
+        self.__create = create
+    def to_url(self, entry):
+        return entry.user_key + "/" + entry.path
+    def to_python(self, urlpart):
+        m = re.match(FILE_REGEX, urlpart)
+        def get_entry():
+            u = query_user(m.group("user"), create = self.__create)
+            e = query_entry(u, m.group("dirname")+m.group("basename"), create = self.__create)
+            u.refresh()
+            return e
+        return Promise(get_entry)
+
+
+def query_entry(user, path, create = False):
+    e = db_session().query(Entry).filter_by(user_key = user.key, path = path).first()
+    if e is None and create:
+        e = Entry(user_key = user.key, user = user, path = path, payload = "")
+        db_session().add(e)
+    if e is None:
+        raise NotFound("invalid entry path")
+    return e
+
+class DirConverter(werkzeug.routing.BaseConverter):
+    regex = nonames(DIR_REGEX)
+
+
+@storage.record_once
+def register_converters(state):
+    state.app.url_map.converters["entry"] = EntryConverter
+    state.app.url_map.converters["user"] = UserConverter
+    state.app.url_map.converters["dir"] = DirConverter
+
+
+
+# all routes are allowed cross origin.
+@storage.after_request
+def cross_origin(r):
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    if flask.request.method == "OPTIONS":
+        if "Allow" in r.headers:
+            r.headers["Access-Control-Allow-Methods"] = r.headers["Allow"]
+        else:
+            r.headers["Access-Control-Allow-Methods"] = "PUT, GET, DELETE, OPTIONS"
+        r.status_code = 200
+    return r
+
+
+@storage.route("/", methods=["GET"])
+def index():
+    return flask.redirect(flask.url_for("static", filename="api_doc.html"))
+
+@storage.route("/<entry:entry>", methods = ["GET"])
+def get(entry):
+    return flask.Response(entry.payload, mimetype = "text/plain")
+
+
+@storage.route("/<entry(create=True):entry>", methods = ["PUT"])
+def put(entry):
+    entry.payload = flask.request.get_data()
+    db_session().add(entry)
+    db_session().add(entry.user)
+    db_session().commit()
+    return "Ok"
+
+@storage.route("/<entry:entry>", methods = ["DELETE"])
+def delete(entry):
+    db_session().delete(entry)
+    db_session().commit()
+    return "Ok"
+
+@storage.route("/<user:user>/<dir:dirname>")
+def ls(user, dirname):
+    pattern = flask.request.args.get("pattern", "%")
+    limit = flask.request.args.get("limit", None)
+    offset = flask.request.args.get("offset", None)
+    q = db_session().query(Entry).\
+            filter(Entry.user_key == user.key).\
+            filter(Entry.path.like(pattern)).\
+            filter(Entry.path.startswith(dirname))
+    print("pattern", pattern)
+    print("limit", limit)
+    print("offset", limit)
+    if limit is not None:
+        q = q.limit(int(limit))
+    if offset is not None:
+        q = q.offset(int(offset))
+
+    result = q.all()
+    return flask.render_template("dirlisting.html", ls = result, user = user, dirname = dirname, pattern = pattern)
+
+
+
+@storage.before_request
+def cleanup():
+    # TODO: delete expired users
+    pass

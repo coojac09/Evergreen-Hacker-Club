@@ -1,0 +1,224 @@
+###POSTHORN
+
+###bugs.md
+# known Problems
+
+- Only works with Chromium
+- Form submission does not reload page, you need to reload manually
+
+###schema.sql
+
+CREATE TABLE user_table (
+	user_id SERIAL PRIMARY KEY,
+    username TEXT,
+	password TEXT,
+	"session" varchar(40)
+	);
+
+CREATE TABLE post_table (
+	post_id SERIAL PRIMARY KEY,
+	post TEXT,
+	posted TIMESTAMP,
+	user_id INTEGER REFERENCES "user_table"
+	);
+
+CREATE TABLE access_table (
+	post_id INTEGER REFERENCES "post_table",
+	user_id INTEGER REFERENCES "user_table"
+	);
+
+CREATE FUNCTION get_posts(fromuser TEXT, asuser TEXT)
+RETURNS SETOF text
+AS $$
+	WITH help AS (SELECT user_id FROM user_table WHERE asuser = username)
+	SELECT format(' (%s)  (%s) ', post, posted)
+	FROM help, post_table INNER JOIN user_table USING (user_id) INNER JOIN access_table USING (post_id)
+	WHERE user_table.username = fromuser AND access_table.user_id = help.user_id;
+$$
+LANGUAGE sql;
+
+CREATE FUNCTION get_friends(fromuser TEXT)
+RETURNS SETOF text
+AS $$
+	WITH help AS (SELECT user_id FROM user_table WHERE fromuser = username)
+	SELECT DISTINCT format(' (%s)  (%s) ', post_table.user_id, username)
+	FROM help, post_table INNER JOIN user_table USING (user_id) INNER JOIN access_table USING (post_id)
+	WHERE access_table.user_id = help.user_id
+$$
+LANGUAGE sql;
+
+###index.cgi
+/loginpage {(loginpage.ps) run} bind def
+/detialpage {(detailpage.ps) run} bind def
+/header {(header.ps) run} bind def
+/userpage {(userpage.ps) run} bind def
+
+(uuid.ps) run
+(psql.ps) run
+(faustlib.ps) run
+(forms.ps) run
+(getparams.ps) run
+
+parseget /getpar exch def
+pagesetup
+
+getpar /page known not {
+	getpar /page (index) put
+} if
+
+(HTTP_COOKIE) getenv
+{
+	(=) search pop pop pop
+	dup () eq {
+		(malformed cookie) loginpage
+	}{
+		checksession /username exch def
+		username () eq {
+			(not logged in) loginpage
+		}{
+			userpage
+		} ifelse
+	} ifelse
+}{
+	(no session cookie) loginpage
+} ifelse
+
+showpage
+
+quit
+###login.cgi
+(uuid.ps) run
+(psql.ps) run
+(faustlib.ps) run
+(fdf.ps) run
+
+
+(HTTP_COOKIE) getenv {
+	(=) search pop pop pop
+}{
+	genuuid
+} ifelse /session exch def
+
+
+newpath 0 0 moveto
+(Set-Cookie: SessionId=) session (
+Content-Type: application/vnd.fdf
+
+%FDF-1.2
+1 0 obj
+<<
+  /FDF
+  <<
+    /F
+    \() (/index.cgi) completeurl (\)
+  >>
+>>
+endobj
+
+trailer
+<</Root 1 0 R>>
+%%EOF
+) 4 {concatstrings} repeat show
+
+0 -30 rmoveto
+
+/formdata parsefdf def
+%formdata /username get show
+0 -20 rmoveto
+%formdata /password get show
+0 -20 rmoveto
+
+/checkpassword
+{
+	sqlescapestring (SELECT password FROM user_table WHERE username = ) exch (;) 2 {concatstrings} repeat sqlgetrow eq
+} bind def
+
+formdata /password get formdata /username get checkpassword
+{
+	(UPDATE user_table SET session = ) session sqlescapestring ( WHERE username = ) formdata /username get sqlescapestring (;) 4 {concatstrings} repeat sqlgetrow
+} if
+
+showpage
+quit
+### post.cgi
+(uuid.ps) run
+(psql.ps) run
+(faustlib.ps) run
+(fdf.ps) run
+
+newpath 0 0 moveto
+(Content-Type: text/plain
+Status: 204 No Response
+) show
+
+/parsereceiver {
+	[ exch {(,) search {exch pop exch}{exit} ifelse} loop]
+} bind def
+
+/accessqry {
+	sqlescapestring
+	(INSERT INTO access_table \(user_id, post_id\) VALUES \(\(SELECT user_id FROM user_table WHERE username = ) exch
+	(\), ) postid (\);) 4 {concatstrings} repeat sqlgetrow
+} bind def
+
+(HTTP_COOKIE) getenv {
+	(=) search pop pop pop dup
+	() eq not {
+		checksession dup
+		() eq not {
+			/username exch def
+			/formdata parsefdf def
+
+			{0 -20 rmoveto} dup exec /content /receiver {formdata exch get show} dup 3 1 roll exec 3 -1 roll exec exec
+
+			0 -20 rmoveto
+			(INSERT INTO post_table \(post, posted, user_id\) VALUES \() formdata /content get sqlescapestring
+			(, now\(\), \(SELECT user_id FROM user_table WHERE username = ) username sqlescapestring
+			(\)\) RETURNING post_id;) 4 {concatstrings} repeat sqlgetrow /postid exch def
+
+			formdata /receiver get parsereceiver {accessqry} forall
+			username accessqry
+		} if
+	} if
+} if
+
+showpage quit
+###register.cgi
+(uuid.ps) run
+(psql.ps) run
+(faustlib.ps) run
+(fdf.ps) run
+
+(HTTP_COOKIE) getenv {
+	(=) search pop pop pop
+}{
+	genuuid
+} ifelse /session exch def
+
+
+newpath 0 0 moveto
+(Content-Type: text/plain
+Set-Cookie: SessionId=) session (
+Status: 204 No Response
+) 2 {concatstrings} repeat show
+
+0 -30 rmoveto
+
+/formdata parsefdf def
+formdata /username get show
+0 -20 rmoveto
+formdata /password get show
+0 -20 rmoveto
+
+/checkuserexists
+{
+	sqlescapestring (SELECT username FROM user_table WHERE username = ) exch (;) 2 {concatstrings} repeat sqlgetrow
+} bind def
+
+formdata /username get dup checkuserexists eq not
+{
+	(INSERT INTO user_table \(username, password\) VALUES \() formdata /username get sqlescapestring (,) formdata /password get sqlescapestring (\);) 4 {concatstrings} repeat sqlgetrow
+} if
+
+showpage
+quit
